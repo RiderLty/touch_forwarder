@@ -1,63 +1,86 @@
 # touch_forwarder
 
-安卓端触摸转发器（Go 实现，纯标准库 + [go-evdev](https://github.com/holoplot/go-evdev)，无 cgo），
-经 adb shell 运行在安卓手机上：
+在已 root 的 Android 设备上读取物理触摸屏事件，并通过 TCP 转发触点的 Go CLI。客户端连接时，程序尝试用 `EVIOCGRAB` 独占触摸屏；客户端断开后释放独占。没有客户端时，手机照常接收触摸。
 
-- 读取本机**真实触摸屏**（Linux evdev 协议 B 多点触摸）；
-- 监听 TCP：**有客户端接入 → `EVIOCGRAB` 独占触摸屏**（安卓系统收不到触摸，
-  相当于锁屏），并把触点编码成 55 AA 控制帧转发给客户端；
-  **无连接 → 不加锁、不转发**，手机触摸完全正常；
-- 一个时刻只服务一个客户端，后来者顶掉前者（旧连接被关闭，锁随之交接）；
-- 客户端断开 → 立即 `Ungrab` 释放触摸屏。
+目前提供 **Android arm64** 可执行文件。设备需要协议 B 多点触摸屏，以及访问 `/dev/input/event*` 的权限（通常通过 `su` 获取）。一个时刻只服务一个 TCP 客户端；新连接会替换旧连接。
 
-## 线上协议（与固件 TCP 6532 控制帧对齐）
+## 下载并运行
 
-```
-[0x55 0xAA][LEN=0x0B][CMD=0xFF][action(1)][id(1)][x(i32 LE)][y(i32 LE)]
-```
+在电脑上安装 [adb](https://developer.android.com/tools/adb) 和 `curl`，开启手机 USB 调试并连接设备。下面的命令可以逐行复制：
 
-| 字段 | 含义 |
-|------|------|
-| CMD `0xFF` | `PIO_CMD_TOUCH`（固件 `handle_control_frame.c`） |
-| action | `1`=DOWN `2`=MOVE `3`=UP |
-| id | 外部触点 ID（1..255 循环，固件映射到独占 HID 槽位） |
-| x/y | 已从 evdev 原始量程缩放到 **0..0x7FFFFFFE**（固件 TOUCH_MAX 坐标空间） |
-
-一帧触点的 UP→DOWN→MOVE 顺序与安卓多点触摸语义一致（同一 SYN_REPORT 内
-先结束旧触点再开启新触点）。客户端接入瞬间会把**已按下的触点补发 DOWN**；
-读取协程自启动起持续消费设备事件，不存在积压帧；曾有的"清积压"双读者设计会截胡第一帧，已删除）。
-
-## 构建与部署
-
-```bash
-./build.sh                       # 产出 bin/touch_forwarder_arm64
-adb push bin/touch_forwarder_arm64 /data/local/tmp/
-adb shell chmod +x /data/local/tmp/touch_forwarder_arm64
-adb shell su -c /data/local/tmp/touch_forwarder_arm64 -listen :6532
+```sh
+curl -fL --retry 3 -o touch_forwarder_arm64 \
+  https://github.com/RiderLty/touch_forwarder/releases/latest/download/touch_forwarder_arm64
+adb devices
+adb push touch_forwarder_arm64 /data/local/tmp/touch_forwarder_arm64
+adb shell chmod 755 /data/local/tmp/touch_forwarder_arm64
+adb shell 'su -c "/data/local/tmp/touch_forwarder_arm64 -listen :6532"'
 ```
 
-读 `/dev/input/event*` 与 `EVIOCGRAB` 都需要 root（`su -c`）或 input 组权限。
-`-listen` 换成手机局域网 IP 可达的端口；若客户端走 adb 隧道，配合
-`adb forward tcp:6532 tcp:6532` 后连 `127.0.0.1:6532`。
+最后一条命令会持续运行并打印日志，另开一个终端连接客户端。通过 adb 隧道访问时，先在电脑上执行：
+
+```sh
+adb forward tcp:6532 tcp:6532
+```
+
+然后让接收端连接电脑的 `127.0.0.1:6532`。如果接收端与手机在同一网络，也可直接连接手机 IP 的 `6532` 端口；这种方式无需 `adb forward`。端口传输的是下述**原始 TCP 二进制帧**，不是 HTTP。
+
+仅需查看触点数据时，支持 TELNET 协议的 `curl` 可以充当临时 TCP 客户端；触摸手机屏幕即可看到十六进制数据，按 Ctrl-C 断开：
+
+```sh
+curl --no-buffer telnet://127.0.0.1:6532 | xxd -g 1
+```
+
+如果手机没有 `su`，或程序无法打开触摸屏设备，就无法正常工作。连接前运行 `adb shell su -c id` 可检查 root 是否可用。若日志提示 `Grab 失败`，触点仍会转发，但手机系统也会同时收到触摸。
+
+## 从源码构建
+
+需要 Go 1.21 或更新版本。在仓库目录执行：
+
+```sh
+./build.sh
+adb push bin/touch_forwarder_arm64 /data/local/tmp/touch_forwarder_arm64
+adb shell chmod 755 /data/local/tmp/touch_forwarder_arm64
+adb shell 'su -c "/data/local/tmp/touch_forwarder_arm64 -listen :6532"'
+```
+
+`build.sh` 使用 `GOOS=android GOARCH=arm64 CGO_ENABLED=0`，输出为 `bin/touch_forwarder_arm64`。
 
 ## 参数
 
-| 参数 | 默认 | 说明 |
-|------|------|------|
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
 | `-listen` | `:6532` | TCP 监听地址 |
-| `-dev` | 自动 | 指定 `/dev/input/eventN`；缺省扫描所有节点，取第一个具备 `ABS_MT_POSITION_X/Y + ABS_MT_TRACKING_ID` 的（协议 B 触摸屏） |
-| `-v` | 关 | 打印每个发出的触点帧（排查用） |
+| `-dev` | 自动发现 | 指定触摸屏设备，如 `/dev/input/event2` |
+| `-v` | 关闭 | 打印每个发送的触点帧 |
 
-## 已知边界
+排查设备选择时可追加 `-dev /dev/input/eventN -v`。自动发现会查找带 `ABS_MT_POSITION_X/Y` 和 `ABS_MT_TRACKING_ID` 的设备，并跳过坐标范围为 `0..32767` 的虚拟触屏。
 
-- **协议 B 专用**：不支持老式协议 A（无 tracking id 的 MT 流）；近十年的安卓
-  触摸屏基本都是协议 B。
-- **Grab 需要写权限**：部分 ROM 只读打开时 `Grab` 会失败，程序退化为
-  "只转发不锁屏"（手机自身同时还会收到触摸），日志里有提示。
-- **中途接入的进行中触点**：客户端接入时若有手指正按着，grab 后该触点在安卓
-  侧没有 UP（系统视角"卡住"）——转发器会把在场触点对新客户端补发 DOWN，
-  手指抬起后一切恢复正常；实践上先连后碰即可完全规避。
-- **坐标直出，无旋转逻辑**：转发的就是触控控制器的原始坐标（仅做量程归一化到
-  0..0x7FFFFFFE，X/Y 轴不交换、不旋转）。手机与接收端握持方向一致时坐标天然 1:1
-  对应；方向不一致属于接收端的事——Pico 面板的屏幕方向设置即可适配，
-  转发器不做（也不该做）任何旋转。
+## TCP 帧格式
+
+每个触点事件发出一个 14 字节帧，客户端按字节流解析：
+
+```text
+55 AA 0B FF action id x0 x1 x2 x3 y0 y1 y2 y3
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `55 AA` | 帧头 |
+| `0B` | 后续数据长度，11 字节 |
+| `FF` | `PIO_CMD_TOUCH` 命令 |
+| `action` | `1` 按下、`2` 移动、`3` 抬起 |
+| `id` | 触点 ID，范围 1..255，循环使用 |
+| `x`、`y` | little-endian 32 位整数；原始坐标缩放到 `0..0x7FFFFFFE` |
+
+同一个 `SYN_REPORT` 内按抬起、按下、移动的顺序发送。程序不旋转或交换 X/Y 轴；接收端需要自行适配屏幕方向。
+
+## 自动发布
+
+每次向任意分支 push，GitHub Actions 都会构建 arm64 CLI，并用 `gh release create` 发布 `touch_forwarder_arm64` 和 `SHA256SUMS`。`main` 分支的构建标记为 Latest，供上面的 `curl` 命令下载；其他分支的构建标记为预发布版本。每次构建使用独立的 `build-<run-id>-<attempt>` 标签。
+
+## 已知限制
+
+- 只支持带 `ABS_MT_TRACKING_ID` 的协议 B 触摸屏和 Android arm64。
+- 如果在手指已经按住屏幕时连接，Android 侧可能收不到该触点的抬起事件；先连接再触摸可避免这种情况。
+- 程序只负责 TCP 触点帧，不实现接收端固件或触摸方向转换。

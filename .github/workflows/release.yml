@@ -1,0 +1,35 @@
+name: Build and release Android CLI
+
+on:
+  push:
+    branches:
+      - '**'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build Android arm64
+        run: ./build.sh
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd bin
+          sha256sum touch_forwarder_arm64 > SHA256SUMS
+          tag="build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          args=(--repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Build ${GITHUB_SHA:0:7}" --notes "Automated Android arm64 build from ${GITHUB_SHA}.")
+          if [[ "$GITHUB_REF" == "refs/heads/main" ]]; then
+            args+=(--latest)
+          else
+            args+=(--prerelease --latest=false)
+          fi
+          gh release create "$tag" touch_forwarder_arm64 SHA256SUMS "${args[@]}"
