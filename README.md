@@ -14,19 +14,7 @@ adb shell chmod 755 /data/local/tmp/touch_forwarder_arm64
 adb shell /data/local/tmp/touch_forwarder_arm64 -listen :6532
 ```
 
-最后一条命令持续运行。另开一个终端，建立 adb 端口转发：
-
-```sh
-adb forward tcp:6532 tcp:6532
-```
-
-客户端连接电脑的 `127.0.0.1:6532` 即可接收触摸帧。也可以直接连接手机局域网 IP 的 `6532` 端口，此时不用端口转发。该端口使用原始 TCP 二进制数据，不是 HTTP。
-
-要查看收到的字节，可在电脑上运行：
-
-```sh
-curl --no-buffer telnet://127.0.0.1:6532 | xxd -g 1
-```
+最后一条命令持续运行。Pico 通过 USB 网卡连接安卓后，直接连接安卓 USB 网卡的 IP 地址和 `6532` 端口即可接收触摸帧。端口使用原始 TCP 二进制数据，不是 HTTP。
 
 ## 从源码构建
 
