@@ -10,7 +10,7 @@
 
 ```sh
 curl -fL --retry 3 -o touch_forwarder_arm64 \
-  https://github.com/RiderLty/touch_forwarder/releases/latest/download/touch_forwarder_arm64
+  "https://github.com/RiderLty/touch_forwarder/releases/latest/download/touch_forwarder_arm64?ts=$(date +%s)"
 adb devices
 adb push touch_forwarder_arm64 /data/local/tmp/touch_forwarder_arm64
 adb shell chmod 755 /data/local/tmp/touch_forwarder_arm64
