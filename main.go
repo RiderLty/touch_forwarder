@@ -35,38 +35,18 @@ func main() {
 	)
 	flag.Parse()
 
-	// 自动发现多点触摸屏（协议 B：X/Y + TRACKING_ID）
-	dev, err := findTouchscreen(*devPath)
+	// 自动发现所有协议 B 多点触摸屏，并按坐标范围排除 Pico/虚拟触屏。
+	devices, err := findTouchscreens(*devPath)
 	if err != nil {
 		log.Fatalf("[forwarder] %v", err)
 	}
-	defer dev.Close()
-
-	name, _ := dev.Name()
-	log.Printf("[forwarder] 使用触摸屏: %s (%s)", name, dev.Path())
-
-	// 读取 X/Y 量程用于缩放（合成事件也要按同一坐标系转发）
-	abs, err := dev.AbsInfos()
-	if err != nil {
-		log.Fatalf("[forwarder] AbsInfos 失败: %v", err)
+	for _, d := range devices {
+		log.Printf("[forwarder] 候选触摸屏: %s (%s), X=[%d..%d] Y=[%d..%d]",
+			d.path, d.name, d.xr.Minimum, d.xr.Maximum, d.yr.Minimum, d.yr.Maximum)
 	}
-	xr, okx := abs[evdev.ABS_MT_POSITION_X]
-	yr, oky := abs[evdev.ABS_MT_POSITION_Y]
-	if !okx || !oky {
-		log.Fatalf("[forwarder] 设备缺少 ABS_MT_POSITION_X/Y 量程")
-	}
-	log.Printf("[forwarder] 量程 X=[%d..%d] Y=[%d..%d] → 0..%d",
-		xr.Minimum, xr.Maximum, yr.Minimum, yr.Maximum, touchCoordMax)
 
 	// 客户端管理：一个时刻只服务一个客户端，后来者顶掉前者。
-	// 顶替时旧连接由 accept 侧同步关闭（旧 goroutine 的 clearIf 会因现任
-	// 已换人而失效，不会把新连接的 Grab 误放掉）。
-	// relay 建在 tracker 之前并**注入 tracker**——emit 检查的就是这一份，
-	// 之前 main 与 tracker 各建一份导致"连接在 main 侧、发射查 tracker 侧"，
-	// 所有触点帧被静默丢弃（已修复的隔离测试抓到的 bug）。
 	relay := &touchRelay{}
-	tracker := newTouchTracker(relay, int32(xr.Minimum), int32(xr.Maximum),
-		int32(yr.Minimum), int32(yr.Maximum), *verbose)
 
 	ln, err := net.Listen("tcp", *listenAddr)
 	if err != nil {
@@ -74,15 +54,44 @@ func main() {
 	}
 	log.Printf("[forwarder] 监听 %s，等待客户端…", *listenAddr)
 
-	// 设备事件读取循环：常驻读取（未连接时只更新状态不转发）
+	// 等待第一个真实触摸屏发出完整 SYN_REPORT。其他设备不会参与事件转发，
+	// 但启动阶段会同时读取它们，避免按 eventN 排序误选开发板或虚拟触屏。
+	type selectionState struct {
+		device  *touchscreenCandidate
+		tracker *touchTracker
+		err     error
+	}
+	selectionReady := make(chan struct{})
+	var selection selectionState
 	go func() {
+		device, initial, selectErr := waitForFirstReport(devices)
+		if selectErr != nil {
+			selection.err = selectErr
+			close(selectionReady)
+			return
+		}
+		selection.device = device
+		selection.tracker = newTouchTracker(relay,
+			int32(device.xr.Minimum), int32(device.xr.Maximum),
+			int32(device.yr.Minimum), int32(device.yr.Maximum), *verbose)
+		for _, ev := range initial {
+			selection.tracker.onEvent(ev)
+		}
+		log.Printf("[forwarder] 使用第一个收到报告的触摸屏: %s (%s)",
+			device.path, device.name)
+		log.Printf("[forwarder] 量程 X=[%d..%d] Y=[%d..%d] → 0..%d",
+			device.xr.Minimum, device.xr.Maximum,
+			device.yr.Minimum, device.yr.Maximum, touchCoordMax)
+		close(selectionReady)
+
+		// 选定设备后持续读取；其他设备已在 waitForFirstReport 中关闭。
 		for {
-			ev, err := dev.ReadOne()
-			if err != nil {
-				log.Printf("[forwarder] 读取失败（设备拔出?）: %v", err)
+			ev, readErr := device.dev.ReadOne()
+			if readErr != nil {
+				log.Printf("[forwarder] 读取失败（设备拔出?）: %v", readErr)
 				return
 			}
-			tracker.onEvent(*ev)
+			selection.tracker.onEvent(*ev)
 		}
 	}()
 
@@ -93,6 +102,14 @@ func main() {
 			if err != nil {
 				return
 			}
+			<-selectionReady
+			if selection.err != nil {
+				log.Printf("[forwarder] 尚未选定触摸屏，关闭客户端: %v", selection.err)
+				_ = conn.Close()
+				continue
+			}
+			dev := selection.device.dev
+			tracker := selection.tracker
 			old := relay.replace(conn)
 			if old != nil {
 				old.Close() // 旧连接的清理 goroutine 会因 clearIf 失效而不 Ungrab
@@ -133,11 +150,16 @@ func main() {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 	log.Printf("[forwarder] 退出")
-	dev.Ungrab()
+	if selection.device != nil {
+		selection.device.dev.Ungrab()
+	}
+	for _, d := range devices {
+		_ = d.dev.Close()
+	}
 	os.Exit(0)
 }
 
-// touchscreenCandidate 是自动发现阶段收集到的协议 B 触摸设备。
+// touchscreenCandidate 是通过分辨率筛选后的协议 B 触摸设备。
 type touchscreenCandidate struct {
 	dev    *evdev.InputDevice
 	path   string
@@ -145,10 +167,26 @@ type touchscreenCandidate struct {
 	xr, yr evdev.AbsInfo
 }
 
-// findTouchscreen 先收集全部协议 B 触摸设备，再按坐标量程过滤虚拟触屏。
-func findTouchscreen(devPath string) (*evdev.InputDevice, error) {
+// findTouchscreens 收集全部协议 B 触摸设备，再按坐标量程过滤虚拟触屏。
+func findTouchscreens(devPath string) ([]*touchscreenCandidate, error) {
 	if devPath != "" {
-		return openDev(devPath)
+		dev, err := openDev(devPath)
+		if err != nil {
+			return nil, err
+		}
+		abs, err := dev.AbsInfos()
+		if err != nil {
+			_ = dev.Close()
+			return nil, err
+		}
+		xr, okx := abs[evdev.ABS_MT_POSITION_X]
+		yr, oky := abs[evdev.ABS_MT_POSITION_Y]
+		if !okx || !oky {
+			_ = dev.Close()
+			return nil, fmt.Errorf("设备缺少 ABS_MT_POSITION_X/Y 量程: %s", devPath)
+		}
+		name, _ := dev.Name()
+		return []*touchscreenCandidate{{dev: dev, path: devPath, name: name, xr: xr, yr: yr}}, nil
 	}
 	paths, err := evdev.ListDevicePaths()
 	if err != nil {
@@ -215,19 +253,51 @@ func findTouchscreen(devPath string) (*evdev.InputDevice, error) {
 		log.Printf("[forwarder] 已按坐标范围跳过虚拟触屏: %s", strings.Join(skipped, ", "))
 	}
 
-	selected := physical[0]
-	for _, c := range physical[1:] {
-		_ = c.dev.Close()
+	return physical, nil
+}
+
+type reportResult struct {
+	device *touchscreenCandidate
+	events []evdev.InputEvent
+	err    error
+}
+
+// waitForFirstReport 并行读取所有候选设备，返回第一个完成 SYN_REPORT 的设备。
+func waitForFirstReport(devices []*touchscreenCandidate) (*touchscreenCandidate, []evdev.InputEvent, error) {
+	results := make(chan reportResult, len(devices))
+	for _, device := range devices {
+		go func(device *touchscreenCandidate) {
+			var events []evdev.InputEvent
+			for {
+				ev, err := device.dev.ReadOne()
+				if err != nil {
+					results <- reportResult{device: device, err: err}
+					return
+				}
+				events = append(events, *ev)
+				if ev.Type == evdev.EV_SYN && ev.Code == evdev.SYN_REPORT {
+					results <- reportResult{device: device, events: events}
+					return
+				}
+			}
+		}(device)
 	}
-	if len(physical) > 1 {
-		var ignored []string
-		for _, c := range physical[1:] {
-			ignored = append(ignored, fmt.Sprintf("%s(%s)", c.path, c.name))
+
+	var lastErr error
+	for remaining := len(devices); remaining > 0; remaining-- {
+		result := <-results
+		if result.err == nil {
+			for _, device := range devices {
+				if device != result.device {
+					_ = device.dev.Close()
+				}
+			}
+			return result.device, result.events, nil
 		}
-		log.Printf("[forwarder] 发现多个真实触摸屏，使用 %s，忽略: %s",
-			selected.path, strings.Join(ignored, ", "))
+		lastErr = result.err
+		log.Printf("[forwarder] 候选触摸屏 %s 读取失败: %v", result.device.path, result.err)
 	}
-	return selected.dev, nil
+	return nil, nil, fmt.Errorf("所有候选触摸屏都无法读取: %w", lastErr)
 }
 
 // openDev 先按常规 O_RDWR 打开（Grab 需要写权限），失败退化为只读

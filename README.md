@@ -27,4 +27,4 @@ adb shell chmod 755 /data/local/tmp/touch_forwarder_arm64
 adb shell /data/local/tmp/touch_forwarder_arm64 -listen :6532
 ```
 
-可用 `-dev /dev/input/eventN` 指定触摸屏设备，`-v` 打印发送的触点帧。默认会枚举所有协议 B 触摸设备，跳过坐标范围为 `0..0x7FFFFFFE` 的 Pico/虚拟触屏，再使用剩余设备中的第一个，并监听 `:6532`。
+可用 `-dev /dev/input/eventN` 指定触摸屏设备，`-v` 打印发送的触点帧。默认会枚举所有协议 B 触摸设备，跳过坐标范围为 `0..0x7FFFFFFE` 的 Pico/虚拟触屏，然后在剩余设备中使用第一个收到完整触摸报告的设备，并监听 `:6532`。
