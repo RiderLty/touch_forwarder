@@ -43,7 +43,7 @@ func main() {
 	defer dev.Close()
 
 	name, _ := dev.Name()
-	log.Printf("[forwarder] 触摸屏: %s (%s)", name, *devPath)
+	log.Printf("[forwarder] 使用触摸屏: %s (%s)", name, dev.Path())
 
 	// 读取 X/Y 量程用于缩放（合成事件也要按同一坐标系转发）
 	abs, err := dev.AbsInfos()
@@ -137,16 +137,25 @@ func main() {
 	os.Exit(0)
 }
 
-// findTouchscreen 自动扫描多点触摸屏；devPath 非空则直接打开指定节点
+// touchscreenCandidate 是自动发现阶段收集到的协议 B 触摸设备。
+type touchscreenCandidate struct {
+	dev    *evdev.InputDevice
+	path   string
+	name   string
+	xr, yr evdev.AbsInfo
+}
+
+// findTouchscreen 先收集全部协议 B 触摸设备，再按坐标量程过滤虚拟触屏。
 func findTouchscreen(devPath string) (*evdev.InputDevice, error) {
 	if devPath != "" {
 		return openDev(devPath)
 	}
 	paths, err := evdev.ListDevicePaths()
 	if err != nil {
-		return nil, fmt.Errorf("列举 /dev/input 失败（需要 root 或 input 组）: %w", err)
+		return nil, fmt.Errorf("列举 /dev/input 失败: %w", err)
 	}
-	var skipped []string
+
+	var candidates []*touchscreenCandidate
 	for _, p := range paths {
 		if !strings.HasPrefix(p.Path, "/dev/input/event") {
 			continue
@@ -161,36 +170,64 @@ func findTouchscreen(devPath string) (*evdev.InputDevice, error) {
 		}
 		if !caps[evdev.ABS_MT_POSITION_X] || !caps[evdev.ABS_MT_POSITION_Y] ||
 			!caps[evdev.ABS_MT_TRACKING_ID] {
-			dev.Close()
+			_ = dev.Close()
 			continue
 		}
-		// 按分辨率跳过 Pico 虚拟触屏：固件触屏/触摸板 HID 描述符声明的是
-		// 0..32767 全域量程，与本机真实触摸屏的面板分辨率相关量程不同。
-		// （抓到虚拟设备会形成 Pico→手机→Pico 的触点回环，必须排除。）
 		abs, err := dev.AbsInfos()
 		if err != nil {
-			dev.Close()
+			_ = dev.Close()
 			continue
 		}
 		xr, okx := abs[evdev.ABS_MT_POSITION_X]
 		yr, oky := abs[evdev.ABS_MT_POSITION_Y]
-		if okx && oky &&
-			xr.Minimum == 0 && xr.Maximum == 32767 &&
-			yr.Minimum == 0 && yr.Maximum == 32767 {
-			name, _ := dev.Name()
-			skipped = append(skipped, fmt.Sprintf("%s(%s, %d×%d)",
-				p.Path, name, xr.Maximum, yr.Maximum))
-			dev.Close()
+		if !okx || !oky {
+			_ = dev.Close()
 			continue
 		}
-		if len(skipped) > 0 {
-			log.Printf("[forwarder] 已跳过 0..32767 全域虚拟设备: %s",
-				strings.Join(skipped, ", "))
-		}
-		return dev, nil
+		name, _ := dev.Name()
+		candidates = append(candidates, &touchscreenCandidate{
+			dev: dev, path: p.Path, name: name, xr: xr, yr: yr,
+		})
 	}
-	return nil, fmt.Errorf("未发现多点触摸屏（协议 B）设备，可用 -dev 指定节点；已跳过虚拟设备: %s",
-		strings.Join(skipped, ", "))
+
+	var physical []*touchscreenCandidate
+	var skipped []string
+	for _, c := range candidates {
+		log.Printf("[forwarder] 发现触摸设备: %s (%s), X=[%d..%d] Y=[%d..%d]",
+			c.path, c.name, c.xr.Minimum, c.xr.Maximum, c.yr.Minimum, c.yr.Maximum)
+		// Pico 的虚拟触屏使用 0..0x7FFFFFFE 坐标空间；真实面板通常
+		// 使用实际分辨率，因此将这种设备从自动发现结果中排除。
+		if c.xr.Minimum == 0 && c.yr.Minimum == 0 &&
+			c.xr.Maximum == touchCoordMax && c.yr.Maximum == touchCoordMax {
+			skipped = append(skipped, fmt.Sprintf("%s(%s, 0..0x%X)",
+				c.path, c.name, touchCoordMax))
+			_ = c.dev.Close()
+			continue
+		}
+		physical = append(physical, c)
+	}
+
+	if len(physical) == 0 {
+		return nil, fmt.Errorf("未发现可用的真实多点触摸屏；已跳过虚拟设备: %s",
+			strings.Join(skipped, ", "))
+	}
+	if len(skipped) > 0 {
+		log.Printf("[forwarder] 已按坐标范围跳过虚拟触屏: %s", strings.Join(skipped, ", "))
+	}
+
+	selected := physical[0]
+	for _, c := range physical[1:] {
+		_ = c.dev.Close()
+	}
+	if len(physical) > 1 {
+		var ignored []string
+		for _, c := range physical[1:] {
+			ignored = append(ignored, fmt.Sprintf("%s(%s)", c.path, c.name))
+		}
+		log.Printf("[forwarder] 发现多个真实触摸屏，使用 %s，忽略: %s",
+			selected.path, strings.Join(ignored, ", "))
+	}
+	return selected.dev, nil
 }
 
 // openDev 先按常规 O_RDWR 打开（Grab 需要写权限），失败退化为只读
